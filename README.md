@@ -2,8 +2,13 @@
 公開/非公開を選択できるファイルサーバー
 
 ## セットアップ (基本的には初回のみでok)
-1. chmod +x ./setup.sh
-2. ./setup.sh
+```bash
+# 実行権限を付与
+chmod +x ./setup.sh
+
+# セットアップの実行
+./setup.sh
+```
 
 ## 起動方法
 ```bash
