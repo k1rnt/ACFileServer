@@ -17,6 +17,8 @@ venv/bin/python3 main.py
 
 # ポートを指定して起動
 venv/bin/python3 main.py 8000
+
+# 起動に成功すると管理画面のパスが表示されます。
 ```
 
 ## 管理画面の認証情報の設定
