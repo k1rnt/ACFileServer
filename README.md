@@ -12,7 +12,7 @@ chmod +x ./setup.sh
 
 ## 起動方法
 ```bash
-# デフォルトでは80番ポートで起動
+# デフォルトでは5000番ポートで起動
 venv/bin/python3 main.py
 
 # ポートを指定して起動
