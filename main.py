@@ -4,8 +4,10 @@ import random
 import string
 import socket
 import secrets
+import io
+import zipfile
 from functools import wraps
-from flask import Flask, send_from_directory, request, redirect, url_for, Response, session, abort
+from flask import Flask, send_from_directory, request, redirect, url_for, Response, session, abort, send_file
 from dotenv import load_dotenv
 from flask_talisman import Talisman
 from werkzeug.utils import secure_filename
@@ -18,6 +20,7 @@ app = Flask(__name__)
 # セッション用 secret_key（.env から取得、なければランダム生成）
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(16))
 
+# Talisman の初期化（force_https=False, session_cookie_secure=False によりHTTP環境でも利用可能）
 Talisman(
     app,
     force_https=False,
@@ -32,44 +35,32 @@ Talisman(
 # ファイル格納ディレクトリ
 FILE_DIRECTORY = "./files"
 
-# ファイルの公開状態（メモリ上の辞書）
-# True: 公開, False: 非公開
+# ファイル・フォルダの公開状態を保持する辞書
+# キーは FILE_DIRECTORY 内での相対パス、値は公開状態（True: 公開, False: 非公開）
 file_status = {}
-
-def load_files():
-    """
-    指定ディレクトリ内のファイル一覧を取得します。
-    """
-    files = []
-    try:
-        for f in os.listdir(FILE_DIRECTORY):
-            if os.path.isfile(os.path.join(FILE_DIRECTORY, f)):
-                files.append(f)
-    except Exception:
-        pass
-    return files
 
 def initialize_file_status():
     """
-    新規ファイルがあれば、デフォルト（非公開）状態で辞書に追加します。
+    FILE_DIRECTORY 以下のすべてのアイテムを再帰的に走査し、
+    新規アイテムに対してデフォルト（非公開）の公開状態を設定する。
     """
-    files = load_files()
-    for f in files:
-        if f not in file_status:
-            file_status[f] = False
-
-# 管理者認証情報（.env から取得）
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "password")
-# 管理画面のパス（.env で指定されなければランダムな16文字）
-ADMIN_ROUTE = os.environ.get("ADMIN_ROUTE")
-if not ADMIN_ROUTE:
-    ADMIN_ROUTE = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    for root, dirs, files in os.walk(FILE_DIRECTORY):
+        rel_root = os.path.relpath(root, FILE_DIRECTORY)
+        if rel_root == ".":
+            rel_root = ""
+        for d in dirs:
+            path = os.path.join(rel_root, d).lstrip(os.sep)
+            if path not in file_status:
+                file_status[path] = False
+        for f in files:
+            path = os.path.join(rel_root, f).lstrip(os.sep)
+            if path not in file_status:
+                file_status[path] = False
 
 def get_lan_ip():
     """
     ホスト名から取得できるIPアドレス群の中から、192.168.で始まるIPを返す。
-    見つからなければソケット接続で得たIPを返す。
+    見つからなければ、ソケット接続で得たIPを返す。
     """
     try:
         hostname = socket.gethostname()
@@ -79,7 +70,6 @@ def get_lan_ip():
                 return ip
     except Exception:
         pass
-
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -90,25 +80,21 @@ def get_lan_ip():
         s.close()
     return ip
 
+# 管理者認証情報（.env から取得）
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "password")
+# 管理画面のパス（.env で指定されなければランダムな16文字）
+ADMIN_ROUTE = os.environ.get("ADMIN_ROUTE")
+if not ADMIN_ROUTE:
+    ADMIN_ROUTE = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+
 def check_auth(username, password):
-    """
-    管理者認証のチェック
-    """
     return username == ADMIN_USERNAME and password == ADMIN_PASSWORD
 
 def authenticate():
-    """
-    認証が必要な場合のレスポンスを返す
-    """
-    return Response(
-        '認証が必要です', 401,
-        {'WWW-Authenticate': 'Basic realm="Login Required"'}
-    )
+    return Response('認証が必要です', 401, {'WWW-Authenticate': 'Basic realm="Login Required"'})
 
 def requires_auth(f):
-    """
-    管理画面へのアクセスに認証を要求するデコレータ
-    """
     @wraps(f)
     def decorated(*args, **kwargs):
         auth = request.authorization
@@ -119,91 +105,135 @@ def requires_auth(f):
 
 @app.after_request
 def set_security_headers(response):
-    """
-    セキュリティヘッダーを設定
-    """
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['Cache-Control'] = 'no-store'
     return response
 
-@app.route("/")
-def index():
-    """
-    エンドユーザー向けのファイル一覧画面（公開ファイルのみ）
-    """
-    initialize_file_status()
-    public_files = [f for f in load_files() if file_status.get(f, False)]
-    html = "<h1>ファイル一覧</h1><ul>"
-    for f in public_files:
-        safe_f = escape(f)
-        html += f'<li><a href="/download/{safe_f}">{safe_f}</a></li>'
-    html += "</ul>"
-    return html
-
-@app.route("/download/<filename>")
-def download(filename):
-    """
-    指定ファイルのダウンロード処理
-    """
-    safe_filename = secure_filename(filename)
-    if safe_filename != filename:
-        return "不正なファイル名です", 400
-    file_path = os.path.join(FILE_DIRECTORY, filename)
-    if not os.path.exists(file_path):
-        return "ファイルが見つかりません", 404
-    if not file_status.get(filename, False):
-        return "このファイルは現在非公開です", 403
-    return send_from_directory(FILE_DIRECTORY, filename, as_attachment=True)
-
 def generate_csrf_token():
-    """
-    CSRF 対策用のトークンを生成し、セッションに保存する
-    """
     token = secrets.token_hex(16)
     session['csrf_token'] = token
     return token
 
+def load_top_items():
+    """
+    FILE_DIRECTORY直下のアイテムのみをリストアップする。
+    """
+    items = []
+    try:
+        for item in sorted(os.listdir(FILE_DIRECTORY)):
+            items.append(item)
+    except Exception:
+        pass
+    return items
+
+def propagate_public_status():
+    """
+    管理者でフォルダが公開に更新された場合、そのフォルダ内の全アイテムも公開にする
+    """
+    for path in list(file_status.keys()):
+        abs_path = os.path.join(FILE_DIRECTORY, path)
+        if os.path.isdir(abs_path) and file_status.get(path, False):
+            for other in file_status:
+                if other != path and other.startswith(path + os.sep):
+                    file_status[other] = True
+
+# ブラウズ画面：指定されたサブパスのディレクトリ内の公開アイテムを一覧表示
+@app.route("/", defaults={"subpath": ""})
+@app.route("/browse/<path:subpath>")
+def browse(subpath):
+    initialize_file_status()
+    abs_path = os.path.join(FILE_DIRECTORY, subpath)
+    if not os.path.isdir(abs_path):
+        return "ディレクトリが見つかりません", 404
+    items = []
+    for item in os.listdir(abs_path):
+        rel_item = os.path.join(subpath, item).lstrip(os.sep)
+        if file_status.get(rel_item, False):
+            full_path = os.path.join(abs_path, item)
+            item_type = "dir" if os.path.isdir(full_path) else "file"
+            items.append((item, item_type))
+    html = "<h1>ファイル一覧</h1>"
+    if subpath:
+        parent = os.path.dirname(subpath)
+        html += f'<a href="{url_for("browse", subpath=parent)}">[..]</a><br>'
+    html += "<ul>"
+    for name, typ in items:
+        safe_name = escape(name)
+        rel_item = os.path.join(subpath, name).lstrip(os.sep)
+        if typ == "dir":
+            link = url_for("browse", subpath=rel_item)
+        else:
+            link = url_for("download", subpath=rel_item)
+        html += f'<li><a href="{link}">{safe_name} ({typ})</a></li>'
+    html += "</ul>"
+    return html
+
+# ダウンロードエンドポイント：ファイルはそのまま送信、ディレクトリはZIP圧縮して送信
+@app.route("/download/<path:subpath>")
+def download(subpath):
+    initialize_file_status()
+    abs_path = os.path.join(FILE_DIRECTORY, subpath)
+    if not os.path.exists(abs_path):
+        return "アイテムが見つかりません", 404
+    if not file_status.get(subpath, False):
+        return "このアイテムは現在非公開です", 403
+    if os.path.isfile(abs_path):
+        directory = os.path.dirname(abs_path)
+        filename = os.path.basename(abs_path)
+        return send_from_directory(directory, filename, as_attachment=True)
+    elif os.path.isdir(abs_path):
+        # ZIP圧縮処理（ZIP Slip 対策、シンボリックリンク除外）
+        memory_file = io.BytesIO()
+        with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(abs_path):
+                for file in files:
+                    abs_file = os.path.join(root, file)
+                    if os.path.islink(abs_file):
+                        continue
+                    rel_file = os.path.relpath(abs_file, abs_path)
+                    if ".." in rel_file:
+                        continue
+                    zf.write(abs_file, arcname=rel_file)
+        memory_file.seek(0)
+        zip_filename = os.path.basename(os.path.normpath(abs_path)) + ".zip"
+        return send_file(memory_file, attachment_filename=zip_filename, as_attachment=True)
+    else:
+        return "不正なアイテムです", 400
+
+# 管理者インターフェース：FILE_DIRECTORY直下のアイテムのみを一覧表示・更新
 @app.route("/" + ADMIN_ROUTE, methods=["GET", "POST"])
 @requires_auth
 def admin():
-    """
-    管理者向けインターフェース
-      GET: ファイル一覧と公開状態を表示
-      POST: CSRF トークン検証後、公開状態を更新
-    """
     initialize_file_status()
     if request.method == "POST":
-        # CSRF トークン検証
         token = request.form.get("csrf_token", "")
         if not token or token != session.get("csrf_token", ""):
             abort(400, "CSRF token missing or invalid")
-        # ファイルの公開状態更新
-        files = load_files()
-        for filename in files:
-            file_status[filename] = (request.form.get(filename) == "on")
+        for item in load_top_items():
+            file_status[item] = (request.form.get(item) == "on")
+        propagate_public_status()
         return redirect(url_for("admin"))
     
     csrf_token = generate_csrf_token()
+    items = load_top_items()
     html = "<h1>管理者インターフェース</h1>"
     html += "<form method='POST'>"
     html += f'<input type="hidden" name="csrf_token" value="{csrf_token}">'
-    html += "<table border='1'><tr><th>ファイル名</th><th>公開状態</th></tr>"
-    for f in load_files():
-        safe_f = escape(f)
-        checked = "checked" if file_status.get(f, False) else ""
-        html += f"<tr><td>{safe_f}</td><td><input type='checkbox' name='{safe_f}' {checked}></td></tr>"
+    html += "<table border='1'><tr><th>アイテム</th><th>公開状態</th></tr>"
+    for item in items:
+        safe_item = escape(item)
+        checked = "checked" if file_status.get(item, False) else ""
+        html += f"<tr><td>{safe_item}</td><td><input type='checkbox' name='{safe_item}' {checked}></td></tr>"
     html += "</table>"
     html += "<input type='submit' value='更新'>"
     html += "</form>"
-    html += '<br><a href="/">ファイル一覧へ戻る</a>'
+    html += '<br><a href="' + url_for("browse", subpath="") + '">ファイル一覧へ戻る</a>'
     return html
 
 if __name__ == "__main__":
     if not os.path.exists(FILE_DIRECTORY):
         os.makedirs(FILE_DIRECTORY)
-    
-    # コマンドライン引数でポート番号を指定（指定がない場合は5000）
     port = 5000
     if len(sys.argv) > 1:
         try:
@@ -211,7 +241,6 @@ if __name__ == "__main__":
         except ValueError:
             print("ポート番号は整数で指定してください")
             sys.exit(1)
-    
     local_ip = get_lan_ip()
     print(f"管理者パネルのURL: http://{local_ip}:{port}/{ADMIN_ROUTE}")
     app.run(host="0.0.0.0", port=port)
